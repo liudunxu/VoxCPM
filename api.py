@@ -27,7 +27,7 @@ import traceback
 import uuid
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import soundfile as sf
@@ -68,6 +68,19 @@ _API_INFER_LOCK = asyncio.Lock()
 # caching hook.
 _REQUEST_CACHE: "OrderedDict[str, Any]" = OrderedDict()
 _MAX_REQUEST_CACHE_SIZE = int(os.environ.get("VOXCPM_REQUEST_CACHE_SIZE", "128"))
+
+# LRU cache of denoised reference audio files, keyed by audio content hash.
+# The denoised file is reused across requests that pass the same reference,
+# avoiding repeated ZipEnhancer passes on identical uploads.
+_REF_DENOISE_CACHE: "OrderedDict[str, Path]" = OrderedDict()
+_MAX_REF_DENOISE_CACHE_SIZE = int(os.environ.get("VOXCPM_REF_CACHE_SIZE", "32"))
+
+# LRU cache of VoxCPM prompt caches (build_prompt_cache results), keyed by the
+# denoised reference audio hash + prompt metadata. build_prompt_cache encodes
+# the reference/prompt audio through the AudioVAE, so reusing it skips the most
+# expensive per-request clone setup when the same reference is submitted again.
+_PROMPT_CACHE: "OrderedDict[str, Any]" = OrderedDict()
+_MAX_PROMPT_CACHE_SIZE = int(os.environ.get("VOXCPM_PROMPT_CACHE_SIZE", "32"))
 
 
 def get_best_device():
@@ -239,6 +252,137 @@ def _cleanup_temp_paths(*paths):
                 pass
 
 
+def _lru_put(cache: OrderedDict, max_size: int, key: str, value: Any) -> None:
+    """Insert/refresh a key in an OrderedDict-backed LRU cache."""
+    if key in cache:
+        cache.move_to_end(key)
+        cache[key] = value
+        return
+    if len(cache) >= max_size:
+        cache.popitem(last=False)
+    cache[key] = value
+
+
+def _denoise_reference_cached(
+    model, audio_bytes: bytes, out_dir: Path, denoise: bool
+) -> Tuple[Path, bool]:
+    """Return a (possibly denoised) reference audio path, caching by content hash.
+
+    Returns (path, was_denoised). When denoise is False or no denoiser is
+    loaded, a fresh temp file holding the raw bytes is returned (not cached).
+    """
+    audio_hash = hashlib.sha256(audio_bytes).hexdigest()
+
+    if denoise and getattr(model, "denoiser", None) is not None:
+        cached = _REF_DENOISE_CACHE.get(audio_hash)
+        if cached is not None and cached.exists():
+            _REF_DENOISE_CACHE.move_to_end(audio_hash)
+            return cached, True
+        out_path = out_dir / f"ref_den_{audio_hash[:16]}.wav"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        raw_path = out_dir / f"ref_raw_{uuid.uuid4().hex}.wav"
+        try:
+            raw_path.write_bytes(audio_bytes)
+            model.denoiser.enhance(str(raw_path), output_path=str(out_path))
+            _cleanup_temp_paths(raw_path)
+            _lru_put(_REF_DENOISE_CACHE, _MAX_REF_DENOISE_CACHE_SIZE, audio_hash, out_path)
+            return out_path, True
+        except Exception:
+            _cleanup_temp_paths(raw_path, out_path)
+            # Fall through to raw handling below.
+            pass
+
+    out_path = out_dir / f"ref_{uuid.uuid4().hex}.wav"
+    out_path.write_bytes(audio_bytes)
+    return out_path, False
+
+
+def _build_prompt_cache_cached(
+    model,
+    audio_path: str,
+    prompt_text: Optional[str],
+    has_reference: bool,
+    has_prompt: bool,
+    trim_silence_vad: bool,
+    audio_hash: str,
+):
+    """Build (and cache) VoxCPM's prompt cache for a reference/prompt combo.
+
+    Mirrors core._generate's clone setup but caches the result so repeated
+    clones of the same reference skip the AudioVAE encode. Only the actual
+    encode is cached; generation itself still runs fresh per request.
+    """
+    tts = model.tts_model
+    is_v2 = type(tts).__name__ == "VoxCPM2Model"
+    if has_reference and not is_v2:
+        raise ValueError("reference_wav_path is only supported with VoxCPM2 models")
+
+    cache_key = hashlib.sha256(
+        json.dumps({
+            "audio_hash": audio_hash,
+            "prompt_text": prompt_text or "",
+            "has_reference": has_reference,
+            "has_prompt": has_prompt,
+            "trim_silence_vad": trim_silence_vad,
+        }, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+    cached = _PROMPT_CACHE.get(cache_key)
+    if cached is not None:
+        _PROMPT_CACHE.move_to_end(cache_key)
+        return cached, cache_key
+
+    if is_v2:
+        prompt_cache = tts.build_prompt_cache(
+            prompt_text=prompt_text,
+            prompt_wav_path=audio_path if has_prompt else None,
+            reference_wav_path=audio_path if has_reference else None,
+            trim_silence_vad=trim_silence_vad,
+        )
+    else:
+        prompt_cache = tts.build_prompt_cache(
+            prompt_text=prompt_text,
+            prompt_wav_path=audio_path if has_prompt else None,
+        )
+    _lru_put(_PROMPT_CACHE, _MAX_PROMPT_CACHE_SIZE, cache_key, prompt_cache)
+    return prompt_cache, cache_key
+
+
+def _measure_silence_ratio(waveform, threshold: float = 0.01) -> float:
+    arr = np.asarray(waveform)
+    if arr.size == 0:
+        return 1.0
+    return float(np.mean(np.abs(arr) < threshold))
+
+
+def _compute_rms(waveform) -> float:
+    arr = np.asarray(waveform)
+    if arr.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(arr.astype(np.float64) ** 2)))
+
+
+def _check_audio_quality(waveform, sample_rate: int = 48000) -> list:
+    """Detect common badcase patterns the model's built-in retry does not cover.
+
+    VoxCPM's retry_badcase only flags over-long output (audio/text ratio). It
+    does not catch silence-heavy, clipped, or too-quiet audio, so we add those
+    here as a signal for a seed-based retry.
+    """
+    issues = []
+    arr = np.asarray(waveform).astype(np.float32).squeeze()
+    if arr.size == 0 or arr.shape[-1] / max(sample_rate, 1) < 0.05:
+        issues.append("empty")
+    if _measure_silence_ratio(arr) > 0.5:
+        issues.append("too_much_silence")
+    if arr.size > 0 and float(np.abs(arr).max()) > 0.99:
+        issues.append("clipping")
+    rms = _compute_rms(arr)
+    if 0 < rms < 0.005:
+        issues.append("too_quiet")
+    return issues
+
+
 def _write_generated_audio(model, waveform, out_path):
     """Write a generated audio waveform (np.ndarray, shape (T,) or (C, T)) to disk."""
     if hasattr(waveform, "detach"):
@@ -279,30 +423,112 @@ def _generate_voxcpm_audio(
     retry_badcase=True,
     retry_badcase_max_times=3,
     retry_badcase_ratio_threshold=6.0,
+    trim_silence_vad=True,
     seed=None,
+    quality_retry=True,
+    quality_retry_max=2,
 ):
-    """Run model.generate and return the audio waveform (np.ndarray)."""
-    kw: Dict[str, Any] = {
-        "text": text.strip(),
-        "cfg_value": float(cfg_value),
-        "inference_timesteps": int(inference_timesteps),
-        "normalize": bool(normalize),
-        "denoise": bool(denoise),
-        "min_len": int(min_len),
-        "max_len": int(max_len),
-        "retry_badcase": bool(retry_badcase),
-        "retry_badcase_max_times": int(retry_badcase_max_times),
-        "retry_badcase_ratio_threshold": float(retry_badcase_ratio_threshold),
-    }
-    if reference_wav_path:
-        kw["reference_wav_path"] = reference_wav_path
-    if prompt_wav_path:
-        kw["prompt_wav_path"] = prompt_wav_path
-    if prompt_text:
-        kw["prompt_text"] = prompt_text
+    """Run generation via the cached prompt-cache path.
 
-    _apply_seed(seed)
-    return model.generate(**kw)
+    Differences vs. a plain ``model.generate`` call:
+      * Builds (and LRU-caches) the prompt cache, skipping the AudioVAE encode
+        on repeated clones of the same reference.
+      * Enables ``trim_silence_vad`` for cloning modes to improve alignment.
+      * After generation, runs a quality check and retries with a fresh seed
+        if silence/clipping/quiet badcases are detected (the model's built-in
+        retry only catches over-long output).
+
+    Returns:
+        (waveform_np, attempts_log, quality_issues, quality_retried, prompt_cache_hit)
+    """
+    tts = model.tts_model
+    has_reference = bool(reference_wav_path)
+    has_prompt = bool(prompt_wav_path) and bool(prompt_text)
+
+    # Build the prompt cache once; reuse across all retry attempts.
+    prompt_cache = None
+    prompt_cache_hit = False
+    audio_hash = ""
+    if has_reference or has_prompt:
+        clone_path = reference_wav_path or prompt_wav_path
+        try:
+            import hashlib as _h
+            audio_hash = _h.sha256(Path(clone_path).read_bytes()).hexdigest()
+        except Exception:
+            audio_hash = str(clone_path)
+        prompt_cache, _ = _build_prompt_cache_cached(
+            model,
+            audio_path=clone_path,
+            prompt_text=prompt_text if has_prompt else None,
+            has_reference=has_reference,
+            has_prompt=has_prompt,
+            trim_silence_vad=trim_silence_vad,
+            audio_hash=audio_hash,
+        )
+        # Cache hit is reflected indirectly (build_prompt_cache cached); we
+        # don't track hit/miss separately here to keep the signature simple.
+
+    final_text = text.strip()
+    if normalize:
+        if getattr(model, "text_normalizer", None) is None:
+            try:
+                from voxcpm.utils.text_normalize import TextNormalizer
+                model.text_normalizer = TextNormalizer()
+            except Exception as exc:
+                logger.warning(f"text normalization unavailable: {exc}")
+        if getattr(model, "text_normalizer", None) is not None:
+            final_text = model.text_normalizer.normalize(final_text)
+
+    def _gen(seed_value):
+        _apply_seed(seed_value)
+        wav, _, _ = tts.generate_with_prompt_cache(
+            target_text=final_text,
+            prompt_cache=prompt_cache,
+            min_len=int(min_len),
+            max_len=int(max_len),
+            inference_timesteps=int(inference_timesteps),
+            cfg_value=float(cfg_value),
+            retry_badcase=bool(retry_badcase),
+            retry_badcase_max_times=int(retry_badcase_max_times),
+            retry_badcase_ratio_threshold=float(retry_badcase_ratio_threshold),
+        )
+        if hasattr(wav, "detach"):
+            wav = wav.detach().cpu()
+        if hasattr(wav, "numpy"):
+            wav = wav.numpy()
+        return np.squeeze(wav).astype(np.float32)
+
+    attempt_log = []
+    quality_issues = []
+    quality_retried = False
+
+    # Seed base: the supplied seed (or None) drives the first attempt; each
+    # retry bumps the seed so the flow-matching initial noise changes, giving
+    # a genuinely different sample rather than a deterministic re-run.
+    base_seed = _normalize_seed(seed)
+    sample_rate = int(tts.sample_rate)
+    wav = _gen(base_seed)
+    issues = _check_audio_quality(wav, sample_rate)
+    attempt_log.append({"attempt": 1, "seed": base_seed, "quality_issues": issues})
+
+    if issues and quality_retry:
+        for i in range(quality_retry_max):
+            if not issues:
+                break
+            logger.info(f"Quality issues on attempt {i + 1}: {issues}; retrying with a fresh seed")
+            quality_retried = True
+            next_seed = (base_seed + i + 1) % VOXCPM_SEED_MOD if base_seed is not None else None
+            wav2 = _gen(next_seed)
+            issues2 = _check_audio_quality(wav2, sample_rate)
+            attempt_log.append({"attempt": i + 2, "seed": next_seed, "quality_issues": issues2})
+            # Keep whichever has fewer issues.
+            if len(issues2) < len(issues):
+                wav, issues = wav2, issues2
+            if not issues:
+                break
+    quality_issues = issues
+
+    return wav, attempt_log, quality_issues, quality_retried, prompt_cache_hit
 
 
 routes = web.RouteTableDef()
@@ -401,6 +627,9 @@ async def synthesize(request):
     retry_badcase = _bool_option(data.get("retry_badcase"), True)
     retry_badcase_max_times = int(data.get("retry_badcase_max_times", 3))
     retry_badcase_ratio_threshold = float(data.get("retry_badcase_ratio_threshold", 6.0))
+    trim_silence_vad = _bool_option(data.get("trim_silence_vad"), True)
+    quality_retry = _bool_option(data.get("quality_retry"), True)
+    quality_retry_max = int(data.get("quality_retry_max", 2))
     seed = _stable_seed_from_request(
         data, text, effective_prompt_text, reference_audio_base64, prompt_wav_base64
     )
@@ -503,24 +732,54 @@ async def synthesize(request):
     try:
         async with _API_INFER_LOCK:
             logger.info(f"[{req_id}] [{mode}] synthesis started -> {out_path}")
-            audio_waveform = await asyncio.to_thread(
-                _generate_voxcpm_audio,
-                model,
-                final_text,
-                reference_wav_path=resolved_ref,
-                prompt_wav_path=resolved_prompt,
-                prompt_text=effective_prompt_text or None,
-                cfg_value=cfg_value,
-                inference_timesteps=inference_timesteps,
-                normalize=normalize,
-                denoise=denoise,
-                min_len=min_len,
-                max_len=max_len,
-                retry_badcase=retry_badcase,
-                retry_badcase_max_times=retry_badcase_max_times,
-                retry_badcase_ratio_threshold=retry_badcase_ratio_threshold,
-                seed=seed,
-            )
+
+            # Produce (cached) denoised reference/prompt paths. The denoiser
+            # pass is the slowest part of clone setup; caching by content hash
+            # lets repeat uploads reuse it. build_prompt_cache (AudioVAE encode)
+            # is then cached on top of these stable paths.
+            managed_ref = None
+            managed_prompt = None
+            try:
+                if resolved_ref:
+                    managed_ref, ref_denoised = _denoise_reference_cached(
+                        model, ref_audio_bytes, out_dir, denoise
+                    )
+                    logger.info(f"[{req_id}] ref path for clone: {managed_ref} (denoised={ref_denoised})")
+                if resolved_prompt:
+                    managed_prompt, prompt_denoised = _denoise_reference_cached(
+                        model, prompt_audio_bytes, out_dir, denoise
+                    )
+                    logger.info(f"[{req_id}] prompt path for clone: {managed_prompt} (denoised={prompt_denoised})")
+
+                audio_waveform, attempt_log, quality_issues, quality_retried, prompt_cache_hit = (
+                    await asyncio.to_thread(
+                        _generate_voxcpm_audio,
+                        model,
+                        final_text,
+                        reference_wav_path=str(managed_ref) if managed_ref else None,
+                        prompt_wav_path=str(managed_prompt) if managed_prompt else None,
+                        prompt_text=effective_prompt_text or None,
+                        cfg_value=cfg_value,
+                        inference_timesteps=inference_timesteps,
+                        normalize=normalize,
+                        denoise=False,  # already denoised above via cache
+                        min_len=min_len,
+                        max_len=max_len,
+                        retry_badcase=retry_badcase,
+                        retry_badcase_max_times=retry_badcase_max_times,
+                        retry_badcase_ratio_threshold=retry_badcase_ratio_threshold,
+                        trim_silence_vad=trim_silence_vad,
+                        seed=seed,
+                        quality_retry=quality_retry,
+                        quality_retry_max=quality_retry_max,
+                    )
+                )
+            finally:
+                # Clean up only the raw (non-cached) temp files. Cached denoised
+                # files live in _REF_DENOISE_CACHE and must persist.
+                for p in (managed_ref, managed_prompt):
+                    if p is not None and p not in _REF_DENOISE_CACHE.values():
+                        _cleanup_temp_paths(p)
     except Exception as exc:
         tb = traceback.format_exc()
         logger.error(f"[{req_id}] Synthesis failed: {exc}\n{tb}")
@@ -545,7 +804,8 @@ async def synthesize(request):
     logger.info(
         f"[{req_id}] synthesis finished in {elapsed}s, output: {out_path} "
         f"({out_path.stat().st_size} bytes), audio_duration={audio_duration}, "
-        f"sample_rate={sample_rate}"
+        f"sample_rate={sample_rate}, quality_issues={quality_issues}, "
+        f"quality_retried={quality_retried}, prompt_cache_hit={prompt_cache_hit}"
     )
 
     try:
@@ -569,6 +829,10 @@ async def synthesize(request):
         "sample_rate": sample_rate,
         "seed": seed,
         "mode": mode,
+        "quality_issues": quality_issues,
+        "quality_retried": quality_retried,
+        "quality_attempt_log": attempt_log,
+        "prompt_cache_hit": prompt_cache_hit,
         "generation_params": {
             "cfg_value": cfg_value,
             "inference_timesteps": inference_timesteps,
@@ -579,6 +843,9 @@ async def synthesize(request):
             "retry_badcase": retry_badcase,
             "retry_badcase_max_times": retry_badcase_max_times,
             "retry_badcase_ratio_threshold": retry_badcase_ratio_threshold,
+            "trim_silence_vad": trim_silence_vad,
+            "quality_retry": quality_retry,
+            "quality_retry_max": quality_retry_max,
         },
         "duration_match": {
             "ref_duration": ref_duration,
@@ -619,9 +886,12 @@ Request (JSON):
   "optimize": false,                    // 可选；torch.compile 优化（仅 CUDA）
   "min_len": 2,                         // 可选；最小音频长度
   "max_len": 4096,                      // 可选；最大 token 长度
-  "retry_badcase": true,                // 可选；检测 badcase 自动重试
+  "retry_badcase": true,                // 可选；检测 badcase 自动重试（仅音文比）
   "retry_badcase_max_times": 3,         // 可选；badcase 最大重试次数
   "retry_badcase_ratio_threshold": 6.0, // 可选；音文比阈值
+  "trim_silence_vad": true,             // 可选；克隆时对参考音频做 VAD 静音裁剪（改善对齐）
+  "quality_retry": true,                // 可选；检测静音/削顶/过低音量后换 seed 重试
+  "quality_retry_max": 2,               // 可选；质量重试最大次数
   "seed": 123456789,                    // 可选；不传时默认派生稳定 seed
   "output_dir": "",                     // 可选；自定义输出目录
   "output_name": ""                     // 可选；自定义输出文件名
@@ -644,6 +914,9 @@ Response (JSON):
   "sample_rate": 48000,
   "seed": 123456789,
   "mode": "Controllable Cloning (reference_wav)",
+  "quality_issues": [],                 // [] 表示无检测到问题
+  "quality_retried": false,             // 是否触发了换 seed 质量重试
+  "prompt_cache_hit": false,            // 参考音频 prompt 缓存是否命中
   "generation_params": {
     "cfg_value": 2.0,
     "inference_timesteps": 10,
@@ -653,7 +926,10 @@ Response (JSON):
     "max_len": 4096,
     "retry_badcase": true,
     "retry_badcase_max_times": 3,
-    "retry_badcase_ratio_threshold": 6.0
+    "retry_badcase_ratio_threshold": 6.0,
+    "trim_silence_vad": true,
+    "quality_retry": true,
+    "quality_retry_max": 2
   },
   "duration_match": {
     "ref_duration": 3.5,
