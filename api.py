@@ -82,6 +82,14 @@ _MAX_REF_DENOISE_CACHE_SIZE = int(os.environ.get("VOXCPM_REF_CACHE_SIZE", "32"))
 _PROMPT_CACHE: "OrderedDict[str, Any]" = OrderedDict()
 _MAX_PROMPT_CACHE_SIZE = int(os.environ.get("VOXCPM_PROMPT_CACHE_SIZE", "32"))
 
+# Session-scoped prompt caches for chained continuation across dubbing segments.
+# Each session holds a growing prompt cache (ref + accumulated generated audio)
+# so segment N+1 continues seamlessly from segment N's voice. Sessions expire
+# after a period of inactivity to bound memory.
+_SESSION_CACHE: "OrderedDict[str, Any]" = OrderedDict()
+_MAX_SESSION_COUNT = int(os.environ.get("VOXCPM_MAX_SESSIONS", "64"))
+_SESSION_TTL_SECONDS = int(os.environ.get("VOXCPM_SESSION_TTL", "1800"))
+
 
 def get_best_device():
     if torch.cuda.is_available():
@@ -383,6 +391,91 @@ def _check_audio_quality(waveform, sample_rate: int = 48000) -> list:
     return issues
 
 
+# Time-stretch limits for duration alignment. Beyond these ratios, stretching
+# degrades audibly (warbling / artifacts) and we fall back to the raw output.
+TIME_STRETCH_MIN_RATE = 0.70   # fastest: 1.43x stretch (slow down)
+TIME_STRETCH_MAX_RATE = 1.43   # slowest: 0.70x compress (speed up)
+
+
+def _time_stretch_to_duration(
+    waveform, sample_rate: int, target_duration: Optional[float],
+    tolerance: float = 0.05,
+) -> Tuple[np.ndarray, Optional[dict]]:
+    """Pitch-preserving time stretch to hit ``target_duration`` (seconds).
+
+    Uses librosa.effects.time_stretch (phase vocoder). Only stretches when the
+    deviation exceeds ``tolerance`` seconds AND the required rate is within the
+    safe band; otherwise returns the waveform unchanged.
+
+    Returns (waveform, info) where info describes what was done (or None).
+    """
+    if target_duration is None or target_duration <= 0:
+        return waveform, None
+    arr = np.asarray(waveform).astype(np.float32).squeeze()
+    if arr.size == 0:
+        return waveform, None
+
+    actual = arr.shape[-1] / sample_rate
+    if abs(actual - target_duration) <= tolerance:
+        return waveform, None
+
+    rate = actual / target_duration  # >1 => too long, speed up
+    if not (TIME_STRETCH_MIN_RATE <= rate <= TIME_STRETCH_MAX_RATE):
+        return waveform, {
+            "applied": False,
+            "reason": "out_of_safe_range",
+            "required_rate": round(rate, 3),
+        }
+
+    import librosa
+    stretched = librosa.effects.time_stretch(arr, rate=rate)
+    info = {
+        "applied": True,
+        "actual_duration": round(actual, 3),
+        "target_duration": round(target_duration, 3),
+        "rate": round(rate, 3),
+        "stretched_duration": round(stretched.shape[-1] / sample_rate, 3),
+    }
+    return stretched.astype(np.float32), info
+
+
+def _session_get(session_id: str, model) -> Optional[dict]:
+    """Look up (and refresh) a session prompt cache. Returns None if missing."""
+    if not session_id:
+        return None
+    entry = _SESSION_CACHE.get(session_id)
+    if entry is None:
+        return None
+    entry["last_used"] = time.time()
+    _SESSION_CACHE.move_to_end(session_id)
+    return entry
+
+
+def _session_put(session_id: str, model, prompt_cache: dict, ref_audio_hash: str,
+                 accumulated_text: str) -> None:
+    """Create or update a session prompt cache entry."""
+    entry = {
+        "prompt_cache": prompt_cache,
+        "ref_audio_hash": ref_audio_hash,
+        "accumulated_text": accumulated_text,
+        "created_at": time.time(),
+        "last_used": time.time(),
+    }
+    _lru_put(_SESSION_CACHE, _MAX_SESSION_COUNT, session_id, entry)
+
+
+def _session_evict_expired() -> int:
+    """Drop sessions idle longer than the TTL. Returns count evicted."""
+    if not _SESSION_CACHE:
+        return 0
+    now = time.time()
+    expired = [k for k, v in _SESSION_CACHE.items()
+               if now - v["last_used"] > _SESSION_TTL_SECONDS]
+    for k in expired:
+        _SESSION_CACHE.pop(k, None)
+    return len(expired)
+
+
 def _write_generated_audio(model, waveform, out_path):
     """Write a generated audio waveform (np.ndarray, shape (T,) or (C, T)) to disk."""
     if hasattr(waveform, "detach"):
@@ -427,6 +520,8 @@ def _generate_voxcpm_audio(
     seed=None,
     quality_retry=True,
     quality_retry_max=2,
+    session_id=None,
+    session_continue=False,
 ):
     """Run generation via the cached prompt-cache path.
 
@@ -437,26 +532,48 @@ def _generate_voxcpm_audio(
       * After generation, runs a quality check and retries with a fresh seed
         if silence/clipping/quiet badcases are detected (the model's built-in
         retry only catches over-long output).
+      * When ``session_id`` is provided, uses a session-scoped prompt cache so
+        segment N+1 continues from segment N's generated audio (chained voice
+        continuity for dubbing). The generated audio features are returned so
+        the caller can merge them back into the session.
 
     Returns:
-        (waveform_np, attempts_log, quality_issues, quality_retried, prompt_cache_hit)
+        (waveform_np, attempts_log, quality_issues, quality_retried,
+         prompt_cache_hit, pred_audio_feat, session_info)
     """
     tts = model.tts_model
     has_reference = bool(reference_wav_path)
     has_prompt = bool(prompt_wav_path) and bool(prompt_text)
 
-    # Build the prompt cache once; reuse across all retry attempts.
+    # Determine the prompt cache to use: session cache (for continuation) takes
+    # precedence, then the freshly-built reference/prompt cache.
     prompt_cache = None
     prompt_cache_hit = False
     audio_hash = ""
-    if has_reference or has_prompt:
+    session_info = {"used": False}
+
+    session_entry = _session_get(session_id, model) if session_id else None
+    if session_continue and session_entry is not None:
+        prompt_cache = session_entry["prompt_cache"]
+        prompt_cache_hit = True
+        session_info = {
+            "used": True,
+            "continued": True,
+            "ref_audio_hash": session_entry["ref_audio_hash"],
+            "accumulated_text_len": len(session_entry["accumulated_text"]),
+        }
+        logger.info(
+            f"[session] continuing session={session_id} "
+            f"(acc_text_len={len(session_entry['accumulated_text'])})"
+        )
+    elif has_reference or has_prompt:
         clone_path = reference_wav_path or prompt_wav_path
         try:
             import hashlib as _h
             audio_hash = _h.sha256(Path(clone_path).read_bytes()).hexdigest()
         except Exception:
             audio_hash = str(clone_path)
-        prompt_cache, _ = _build_prompt_cache_cached(
+        prompt_cache, prompt_cache_hit = _build_prompt_cache_cached(
             model,
             audio_path=clone_path,
             prompt_text=prompt_text if has_prompt else None,
@@ -465,8 +582,6 @@ def _generate_voxcpm_audio(
             trim_silence_vad=trim_silence_vad,
             audio_hash=audio_hash,
         )
-        # Cache hit is reflected indirectly (build_prompt_cache cached); we
-        # don't track hit/miss separately here to keep the signature simple.
 
     final_text = text.strip()
     if normalize:
@@ -481,7 +596,7 @@ def _generate_voxcpm_audio(
 
     def _gen(seed_value):
         _apply_seed(seed_value)
-        wav, _, _ = tts.generate_with_prompt_cache(
+        wav, _text_tok, pred_feat = tts.generate_with_prompt_cache(
             target_text=final_text,
             prompt_cache=prompt_cache,
             min_len=int(min_len),
@@ -496,18 +611,15 @@ def _generate_voxcpm_audio(
             wav = wav.detach().cpu()
         if hasattr(wav, "numpy"):
             wav = wav.numpy()
-        return np.squeeze(wav).astype(np.float32)
+        return np.squeeze(wav).astype(np.float32), pred_feat
 
     attempt_log = []
     quality_issues = []
     quality_retried = False
 
-    # Seed base: the supplied seed (or None) drives the first attempt; each
-    # retry bumps the seed so the flow-matching initial noise changes, giving
-    # a genuinely different sample rather than a deterministic re-run.
     base_seed = _normalize_seed(seed)
     sample_rate = int(tts.sample_rate)
-    wav = _gen(base_seed)
+    wav, pred_feat = _gen(base_seed)
     issues = _check_audio_quality(wav, sample_rate)
     attempt_log.append({"attempt": 1, "seed": base_seed, "quality_issues": issues})
 
@@ -518,17 +630,45 @@ def _generate_voxcpm_audio(
             logger.info(f"Quality issues on attempt {i + 1}: {issues}; retrying with a fresh seed")
             quality_retried = True
             next_seed = (base_seed + i + 1) % VOXCPM_SEED_MOD if base_seed is not None else None
-            wav2 = _gen(next_seed)
+            wav2, pred_feat2 = _gen(next_seed)
             issues2 = _check_audio_quality(wav2, sample_rate)
             attempt_log.append({"attempt": i + 2, "seed": next_seed, "quality_issues": issues2})
-            # Keep whichever has fewer issues.
+            # Keep whichever has fewer issues; prefer the kept one's features.
             if len(issues2) < len(issues):
-                wav, issues = wav2, issues2
+                wav, issues, pred_feat = wav2, issues2, pred_feat2
             if not issues:
                 break
     quality_issues = issues
 
-    return wav, attempt_log, quality_issues, quality_retried, prompt_cache_hit
+    # If a session is active, merge this segment's audio back so the next call
+    # in the session continues from it. We move pred_feat to CPU to keep the
+    # session cache device-agnostic and avoid pinning GPU memory.
+    if session_id is not None:
+        feat_cpu = pred_feat.detach().cpu() if hasattr(pred_feat, "detach") else pred_feat
+        if session_entry is not None and session_continue:
+            # Existing session: extend accumulated audio + text.
+            merged = tts.merge_prompt_cache(
+                session_entry["prompt_cache"], final_text, feat_cpu
+            )
+            session_entry["prompt_cache"] = merged
+            session_entry["accumulated_text"] += final_text
+            session_entry["last_used"] = time.time()
+            session_info["merged"] = True
+            session_info["accumulated_text_len"] = len(session_entry["accumulated_text"])
+        elif prompt_cache is not None:
+            # New session seeded from this segment's reference/prompt cache.
+            merged = tts.merge_prompt_cache(prompt_cache, final_text, feat_cpu)
+            _session_put(
+                session_id, model, merged, audio_hash, final_text
+            )
+            session_info = {
+                "used": True,
+                "continued": False,
+                "created": True,
+                "accumulated_text_len": len(final_text),
+            }
+
+    return wav, attempt_log, quality_issues, quality_retried, prompt_cache_hit, pred_feat, session_info
 
 
 routes = web.RouteTableDef()
@@ -567,6 +707,9 @@ async def unload(request):
     count = 1 if _API_MODEL is not None else 0
     _API_MODEL = None
     _REQUEST_CACHE.clear()
+    _REF_DENOISE_CACHE.clear()
+    _PROMPT_CACHE.clear()
+    _SESSION_CACHE.clear()
     import gc
     gc.collect()
     if sys.platform != "win32":
@@ -630,13 +773,34 @@ async def synthesize(request):
     trim_silence_vad = _bool_option(data.get("trim_silence_vad"), True)
     quality_retry = _bool_option(data.get("quality_retry"), True)
     quality_retry_max = int(data.get("quality_retry_max", 2))
-    seed = _stable_seed_from_request(
+
+    # Session-based chained continuation for dubbing: pass the same session_id
+    # across segments of one voice to make segment N+1 continue from segment N.
+    # The first call seeds the session; subsequent calls set session_continue.
+    session_id = (data.get("session_id") or "").strip() or None
+    session_continue = _bool_option(data.get("session_continue"), True)
+
+    # Duration alignment (dubbing): target_duration_ms is the desired output
+    # length; we time-stretch the generated audio to hit it (pitch-preserving).
+    target_duration_ms = data.get("target_duration_ms")
+    duration_tolerance_ms = data.get("duration_tolerance_ms")
+
+    # Allow the caller to force a specific seed (per-character fixed seed for
+    # cross-segment voice consistency). Falls back to the derived stable seed.
+    explicit_seed = _normalize_seed(data.get("seed") or data.get("voxcpm_seed"))
+    seed = explicit_seed if explicit_seed is not None else _stable_seed_from_request(
         data, text, effective_prompt_text, reference_audio_base64, prompt_wav_base64
     )
 
     # Prepare output directory.
     out_dir = Path(data.get("output_dir") or OUTPUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Opportunistically evict expired dubbing sessions.
+    if _SESSION_CACHE:
+        evicted = _session_evict_expired()
+        if evicted:
+            logger.info(f"[{req_id}] evicted {evicted} expired sessions")
 
     # Decode reference / prompt audio to temp files.
     ref_temp_path = None
@@ -751,28 +915,36 @@ async def synthesize(request):
                     )
                     logger.info(f"[{req_id}] prompt path for clone: {managed_prompt} (denoised={prompt_denoised})")
 
-                audio_waveform, attempt_log, quality_issues, quality_retried, prompt_cache_hit = (
-                    await asyncio.to_thread(
-                        _generate_voxcpm_audio,
-                        model,
-                        final_text,
-                        reference_wav_path=str(managed_ref) if managed_ref else None,
-                        prompt_wav_path=str(managed_prompt) if managed_prompt else None,
-                        prompt_text=effective_prompt_text or None,
-                        cfg_value=cfg_value,
-                        inference_timesteps=inference_timesteps,
-                        normalize=normalize,
-                        denoise=False,  # already denoised above via cache
-                        min_len=min_len,
-                        max_len=max_len,
-                        retry_badcase=retry_badcase,
-                        retry_badcase_max_times=retry_badcase_max_times,
-                        retry_badcase_ratio_threshold=retry_badcase_ratio_threshold,
-                        trim_silence_vad=trim_silence_vad,
-                        seed=seed,
-                        quality_retry=quality_retry,
-                        quality_retry_max=quality_retry_max,
-                    )
+                (
+                    audio_waveform,
+                    attempt_log,
+                    quality_issues,
+                    quality_retried,
+                    prompt_cache_hit,
+                    _pred_feat,
+                    session_info,
+                ) = await asyncio.to_thread(
+                    _generate_voxcpm_audio,
+                    model,
+                    final_text,
+                    reference_wav_path=str(managed_ref) if managed_ref else None,
+                    prompt_wav_path=str(managed_prompt) if managed_prompt else None,
+                    prompt_text=effective_prompt_text or None,
+                    cfg_value=cfg_value,
+                    inference_timesteps=inference_timesteps,
+                    normalize=normalize,
+                    denoise=False,  # already denoised above via cache
+                    min_len=min_len,
+                    max_len=max_len,
+                    retry_badcase=retry_badcase,
+                    retry_badcase_max_times=retry_badcase_max_times,
+                    retry_badcase_ratio_threshold=retry_badcase_ratio_threshold,
+                    trim_silence_vad=trim_silence_vad,
+                    seed=seed,
+                    quality_retry=quality_retry,
+                    quality_retry_max=quality_retry_max,
+                    session_id=session_id,
+                    session_continue=session_continue,
                 )
             finally:
                 # Clean up only the raw (non-cached) temp files. Cached denoised
@@ -785,6 +957,22 @@ async def synthesize(request):
         logger.error(f"[{req_id}] Synthesis failed: {exc}\n{tb}")
         _cleanup_temp_paths(ref_temp_path, prompt_temp_path)
         return _error(f"Synthesis failed: {exc}\n{tb}", status=502)
+
+    # Duration alignment: pitch-preserving time-stretch toward target_duration.
+    stretch_info = None
+    target_duration_sec = (
+        float(target_duration_ms) / 1000.0 if target_duration_ms is not None else None
+    )
+    tolerance_sec = (
+        float(duration_tolerance_ms) / 1000.0 if duration_tolerance_ms is not None else 0.05
+    )
+    if target_duration_sec is not None:
+        sample_rate_pre = int(model.tts_model.sample_rate)
+        audio_waveform, stretch_info = _time_stretch_to_duration(
+            audio_waveform, sample_rate_pre, target_duration_sec, tolerance=tolerance_sec
+        )
+        if stretch_info:
+            logger.info(f"[{req_id}] time-stretch: {stretch_info}")
 
     try:
         sample_rate = _write_generated_audio(model, audio_waveform, out_path)
@@ -805,7 +993,8 @@ async def synthesize(request):
         f"[{req_id}] synthesis finished in {elapsed}s, output: {out_path} "
         f"({out_path.stat().st_size} bytes), audio_duration={audio_duration}, "
         f"sample_rate={sample_rate}, quality_issues={quality_issues}, "
-        f"quality_retried={quality_retried}, prompt_cache_hit={prompt_cache_hit}"
+        f"quality_retried={quality_retried}, prompt_cache_hit={prompt_cache_hit}, "
+        f"session={'on' if session_info.get('used') else 'off'}"
     )
 
     try:
@@ -833,6 +1022,14 @@ async def synthesize(request):
         "quality_retried": quality_retried,
         "quality_attempt_log": attempt_log,
         "prompt_cache_hit": prompt_cache_hit,
+        "session": session_info,
+        "duration_alignment": {
+            "target_duration_ms": target_duration_ms,
+            "duration_tolerance_ms": duration_tolerance_ms,
+            "stretch": stretch_info,
+            "actual_duration_seconds": audio_duration,
+            "target_duration_seconds": round(target_duration_sec, 3) if target_duration_sec else None,
+        },
         "generation_params": {
             "cfg_value": cfg_value,
             "inference_timesteps": inference_timesteps,
@@ -846,6 +1043,8 @@ async def synthesize(request):
             "trim_silence_vad": trim_silence_vad,
             "quality_retry": quality_retry,
             "quality_retry_max": quality_retry_max,
+            "session_id": session_id,
+            "session_continue": session_continue,
         },
         "duration_match": {
             "ref_duration": ref_duration,
@@ -853,6 +1052,45 @@ async def synthesize(request):
             "match_ratio": round(audio_duration / ref_duration, 3) if ref_duration and audio_duration else None,
         },
     })
+
+
+@routes.get("/api/voxcpm/sessions")
+@routes.get("/api/sessions")
+async def sessions_list(request):
+    """List active dubbing sessions (id + accumulated text length + last used)."""
+    now = time.time()
+    items = []
+    for sid, entry in _SESSION_CACHE.items():
+        items.append({
+            "session_id": sid,
+            "ref_audio_hash": entry.get("ref_audio_hash", "")[:16],
+            "accumulated_text_len": len(entry.get("accumulated_text", "")),
+            "idle_seconds": round(now - entry["last_used"], 1),
+        })
+    return _json_response({
+        "ok": True,
+        "count": len(items),
+        "sessions": items,
+        "ttl_seconds": _SESSION_TTL_SECONDS,
+        "max_sessions": _MAX_SESSION_COUNT,
+    })
+
+
+@routes.post("/api/voxcpm/session/clear")
+@routes.post("/api/session/clear")
+async def session_clear(request):
+    """Clear one session (body: {"session_id": "..."}) or all sessions if none given."""
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    sid = (data.get("session_id") or "").strip()
+    if sid:
+        removed = 1 if _SESSION_CACHE.pop(sid, None) is not None else 0
+        return _json_response({"ok": True, "cleared": removed, "scope": "one", "session_id": sid})
+    removed = len(_SESSION_CACHE)
+    _SESSION_CACHE.clear()
+    return _json_response({"ok": True, "cleared": removed, "scope": "all"})
 
 
 @routes.get("/")
@@ -869,6 +1107,8 @@ GET  /api/health
 GET  /api/voxcpm/status  (alias: /api/status)
 POST /api/voxcpm/unload  (alias: /api/unload)
 POST /api/voxcpm/synthesize  (alias: /api/synthesize)
+GET  /api/voxcpm/sessions  (alias: /api/sessions)            // 列出配音会话
+POST /api/voxcpm/session/clear  (alias: /api/session/clear)  // 清除会话
 
 Request (JSON):
 {
@@ -879,10 +1119,10 @@ Request (JSON):
   "control_instruction": "年轻女性，温柔甜美",                  // 可选；声音设计 / 可控克隆风格描述（别名 instruct）
   "model_id": "openbmb/VoxCPM2",
   "device": "auto",                     // auto / cpu / mps / cuda / cuda:N
-  "cfg_value": 2.0,                     // 可选；CFG 引导强度
-  "inference_timesteps": 10,            // 可选；LocDiT 流匹配步数
+  "cfg_value": 2.0,                     // 可选；CFG 引导强度（克隆建议 2.0-2.5）
+  "inference_timesteps": 10,            // 可选；LocDiT 流匹配步数（质量 20-30 更佳）
   "denoise": true,                      // 可选；是否对参考音频降噪（需加载 denoiser）
-  "normalize": false,                   // 可选；文本规范化
+  "normalize": false,                   // 可选；文本规范化（配音建议 true）
   "optimize": false,                    // 可选；torch.compile 优化（仅 CUDA）
   "min_len": 2,                         // 可选；最小音频长度
   "max_len": 4096,                      // 可选；最大 token 长度
@@ -892,7 +1132,11 @@ Request (JSON):
   "trim_silence_vad": true,             // 可选；克隆时对参考音频做 VAD 静音裁剪（改善对齐）
   "quality_retry": true,                // 可选；检测静音/削顶/过低音量后换 seed 重试
   "quality_retry_max": 2,               // 可选；质量重试最大次数
-  "seed": 123456789,                    // 可选；不传时默认派生稳定 seed
+  "seed": 123456789,                    // 可选；固定 seed（每角色固定以保证跨片段一致）
+  "session_id": "char_01_seg_1",        // 可选；配音会话 ID，同一角色跨片段复用以保持音色连续
+  "session_continue": true,             // 可选；续写模式（首片段可不传或 false，自动建会话）
+  "target_duration_ms": 2200,           // 可选；目标输出时长（配音对齐原片时长）
+  "duration_tolerance_ms": 100,         // 可选；时长容差，超容差触发保调 time-stretch
   "output_dir": "",                     // 可选；自定义输出目录
   "output_name": ""                     // 可选；自定义输出文件名
 }
@@ -917,6 +1161,12 @@ Response (JSON):
   "quality_issues": [],                 // [] 表示无检测到问题
   "quality_retried": false,             // 是否触发了换 seed 质量重试
   "prompt_cache_hit": false,            // 参考音频 prompt 缓存是否命中
+  "session": {"used": true, "created": true, "accumulated_text_len": 24}, // 配音会话状态
+  "duration_alignment": {               // 时长对齐信息
+    "target_duration_ms": 2200,
+    "stretch": {"applied": true, "actual_duration": 2.5, "target_duration": 2.2, "rate": 1.136},
+    "actual_duration_seconds": 2.2
+  },
   "generation_params": {
     "cfg_value": 2.0,
     "inference_timesteps": 10,
@@ -929,7 +1179,9 @@ Response (JSON):
     "retry_badcase_ratio_threshold": 6.0,
     "trim_silence_vad": true,
     "quality_retry": true,
-    "quality_retry_max": 2
+    "quality_retry_max": 2,
+    "session_id": "char_01_seg_1",
+    "session_continue": true
   },
   "duration_match": {
     "ref_duration": 3.5,
